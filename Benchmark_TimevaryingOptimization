@@ -1,0 +1,196 @@
+import numpy as np
+import pandas as pd
+from functools import reduce
+
+import gurobipy as gp
+from gurobipy import GRB
+
+# Contact matrix
+contact_mat = pd.read_excel('D:/2021SpringStudy/Research/MCSI/Python/COVID_test_allocation/timevarying/contact.xlsx', index_col=0)
+
+
+# Population segmentation
+pop_data = pd.read_excel(open('D:/2021SpringStudy/Research/MCSI/Python/COVID_test_allocation/timevarying/population.xlsx', 'rb'),  index_col=0)
+pop = pop_data["Total"]
+pop_tier = pop_data[{"Tier12", "Tier3"}]
+groups = list(pop_data.index)
+
+
+# Heterogenous susceptability
+ra = pop_data["heter susceptability"]
+ra = ra / max(ra)
+# Vaccine accpetance
+va = 1
+
+
+# Risk of disease burdens
+risks = {}
+for age_group in groups:
+    if age_group in ['0_4']:
+        risk = 0.001
+        risks[age_group] = risk
+    elif age_group in ['5_9', '10_14', '15_17']:
+        risk = 0.001
+        risks[age_group] = risk
+    elif age_group in ['18_19', '20_', '21_', '22_24', '25_29']:
+        risk = 0.001
+        risks[age_group] = risk
+    elif age_group in ['30_34', '35_39']:
+        risk = 0.004
+        risks[age_group] = risk
+    elif age_group in ['40_44', '45_49']:
+        risk = 0.010
+        risks[age_group] = risk
+    elif age_group in ['50_54', '55_59', '60_61', '62_64']:
+        risk = 0.025
+        risks[age_group] = risk
+    elif age_group in ['65_66', '67_69', '70_74']:
+        risk = 0.065
+        risks[age_group] = risk
+    elif age_group in ['75_79', '80_84']:
+        risk = 0.15
+        risks[age_group] = risk
+    elif age_group in ['85+']:
+        risk = 0.37
+        risks[age_group] = risk
+#risk_data = pd.read_excel(open('.../GitHubTest/input/disease_burden-1117_python.xlsx', 'rb'), sheet_name='risk rates',
+ #                         index_col=0)
+# Targeted risk in optimization
+#risk = risk_data["Deaths in infections"]
+
+
+# Dyanmics from the myopic optimization
+targetI = pd.read_csv('D:/2021SpringStudy/Research/MCSI/Python/COVID_test_allocation/timevarying/temporary.csv', index_col=0)
+
+groups = list(pop_data.index)
+
+# Period
+T = 6 # same as the number of bathces
+days = range(0, T + 1)
+tiers = ["Tier12", "Tier3"]
+# vaccine efficacy
+ve = 1
+
+beta = 0.0223921  
+gamma = 1 / 5.5
+w = 1 / 35
+max_capacity = 40000 / 2  # daily supplies, namely the batch size
+epsilon = 0.4
+
+for groupJ in groups:
+    for group in groups:
+        contact_mat[groupJ][group] = contact_mat[groupJ][group] * ra[group]
+
+vaCpt = gp.Model('Vaccination Capacity I')
+
+stateS = vaCpt.addVars(days, groups, lb=0, name="S")  # disease state S
+stateI = vaCpt.addVars(days, groups, lb=0, name="I")  # disease state I
+stateU = vaCpt.addVars(days, groups, lb=0, name="U")  # disease state U
+stateV = vaCpt.addVars(days, groups, lb=0, name="V")  # disease state V
+alloc_tier = vaCpt.addVars(days, groups, tiers, lb=0, ub=max_capacity,
+                          name="Allocation")  # quantity allocated based on tiers
+alloc_cum = vaCpt.addVars(days, groups, lb=0, name="Allocation")
+capacity = vaCpt.addVars(days, lb=0, ub=max_capacity, name="Capacity")  # daily supplies
+cpt = vaCpt.addVar(0.0, max_capacity, name="Cpt")  # quantity manufactored
+threshold = vaCpt.addVars(days, vtype=gp.GRB.BINARY, name="Threshold")  #
+
+# 1. Initial ODE
+ProgressI0 = vaCpt.addConstrs((stateI[0, group] == 1 for group in groups), name="Initial_I0")
+ProgressS0 = vaCpt.addConstrs((stateS[0, group] == pop[group] - stateI[0, group] for group in groups),
+                              name="Initial_S0")
+ProgressU0 = vaCpt.addConstrs((stateU[0, group] == 0 for group in groups), name="Initial_U0")
+ProgressV0 = vaCpt.addConstrs((stateV[0, group] == 0 for group in groups), name="Initial_V0")
+Va_cumsum = vaCpt.addConstrs((alloc_cum[0, group] == 0 for group in groups), name="Initial_va_Tier12")
+
+# 2. ODE Progress
+ProgressS = vaCpt.addConstrs((stateS[days[days.index(day) + 1], group] >= stateS[day, group] - gp.quicksum(
+    alloc_tier[day, group, tier] for tier in tiers) -
+                              beta * stateS[day, group] * (
+                                  gp.quicksum(contact_mat[groupJ][group] * targetI[groupJ][day] / pop[groupJ]
+                                              for groupJ in groups)) for group in groups for day in days if day != T),
+                             name="ProgressS")
+ProgressV = vaCpt.addConstrs((stateV[days[days.index(day) + 1], group] >= (
+            stateV[day, group] + gp.quicksum(alloc_tier[day, group, tier] for tier in tiers)) * (1 - w) -
+                              stateV[day, group] * beta * (
+                                  gp.quicksum(contact_mat[groupJ][group] * targetI[groupJ][day] / pop[groupJ]
+                                              for groupJ in groups)) for group in groups for day in days if day != T),
+                             name="ProgressV")
+ProgressU = vaCpt.addConstrs((
+                             stateU[days[days.index(day) + 1], group] >= stateU[day, group] + stateV[day, group] * w * (
+                                         1 - ve) - stateU[day, group] *
+                             beta * (gp.quicksum(contact_mat[groupJ][group] * targetI[groupJ][day] / pop[groupJ]
+                                                 for groupJ in groups)) for group in groups for day in days if
+                             day != T), name="ProgressU")
+ProgressI = vaCpt.addConstrs((stateI[days[days.index(day) + 1], group] >= stateI[day, group] * (1 - gamma) +
+                              (stateS[day, group] + stateU[day, group] + stateV[day, group]) *
+                              beta * (gp.quicksum(contact_mat[groupJ][group] * targetI[groupJ][day] / pop[groupJ]
+                                                  for groupJ in groups)) for group in groups for day in days if
+                              day != T), name="ProgressI")
+
+# 3. Approximation
+TargetDeath = vaCpt.addConstrs((gp.quicksum(contact_mat[groupJ][group] * stateI[day, groupJ] / pop[groupJ]
+                                            for groupJ in groups) - gp.quicksum(
+    contact_mat[groupJ][group] * targetI[groupJ][day] / pop[groupJ]
+    for groupJ in groups) <= epsilon for group in groups for day in days), name="TargetDeath")
+TargetDeath2 = vaCpt.addConstrs((-gp.quicksum(contact_mat[groupJ][group] * stateI[day, groupJ] / pop[groupJ]
+                                              for groupJ in groups) + gp.quicksum(
+    contact_mat[groupJ][group] * targetI[groupJ][day] / pop[groupJ]
+    for groupJ in groups) <= epsilon for group in groups for day in days), name="TargetDeath2")
+# 4. Daily supply constraint
+VaCap = vaCpt.addConstrs((gp.quicksum(alloc_tier[day, group, tier] for group in groups for tier in tiers)
+                          <= max_capacity for day in days), name="Capacity")  # 5b
+
+# 5. Allocation Constraint
+VaAlloc = vaCpt.addConstrs((gp.quicksum(alloc_tier[day, group, tier] for tier in tiers) <= stateS[day, group]
+                            for group in groups for day in days), name="ConstAllocation")  # 5c
+VaAlloc2 = vaCpt.addConstrs(
+    (gp.quicksum(alloc_tier[day, group, tier] for day in days) <= pop_tier[tier][group] * va
+     for group in groups for tier in tiers), name="ConstAllocation2")  # 5e 前半截表达存疑
+VaAlloc3 = vaCpt.addConstrs(
+    (alloc_cum[days[days.index(day) + 1], group] == alloc_cum[day, group] + alloc_tier[day, group, "Tier12"]
+     for group in groups for day in days if day != T), name="ConstAllocation3")  # 5d
+VaAlloc4 = vaCpt.addConstrs((alloc_tier[day, group, "Tier12"] >= max_capacity * (
+(pop_tier["Tier12"][group] * va)) / sum(pop_tier["Tier12"][group] *
+                                                         va for group in groups) - threshold[
+                                 day] * max_capacity
+                             for group in groups for day in days), name="ConstAllocation4")  # 5h
+
+# 6. Tier Constraint
+TierAlloc = vaCpt.addConstrs((gp.quicksum(alloc_tier[day, group, "Tier3"] for group in groups) <= threshold[day] * (
+            max_capacity + gp.quicksum(pop_tier["Tier12"][group] * va
+                                       for group in groups)) for day in days), name="ConstTier")  # 5f
+TierAlloc3 = vaCpt.addConstrs((gp.quicksum(alloc_tier[day, group, "Tier3"] for group in groups) <= (
+            1 - threshold[day]) * (gp.quicksum(pop_tier["Tier12"][group] * va
+                                               for group in groups)) + max_capacity +
+                               gp.quicksum(alloc_cum[day, group] for group in groups) - gp.quicksum(
+    pop_tier["Tier12"][group] * va for group in groups) for day in days), name="ConstTier3")  # 5g
+
+# 0. Objective Function
+
+obj = gp.quicksum(
+    (stateI[days.index(day) + 1, group] - (1 - gamma) * stateI[day, group]) * risks[group] for group in groups for day in
+    days if day != T)
+
+vaCpt.setObjective(obj, GRB.MINIMIZE)
+
+# vaCpt.Params.BarHomogeneous=1
+vaCpt.optimize()
+
+# Output optimal solutions
+rows = days
+columns = groups.copy()
+va_alloc12 = pd.DataFrame(columns=columns, index=rows, data=0.0)
+va_alloc3 = pd.DataFrame(columns=columns, index=rows, data=0.0)
+va_alloc = pd.DataFrame(columns=columns, index=rows, data=0.0)
+
+for day, group, tier in alloc_tier.keys():
+    if (abs(alloc_tier[day, group, tier].x) > 1e-6):
+        if (tier in ['Tier12']):
+            va_alloc12.loc[day, group] = np.round(alloc_tier[day, group, tier].x, 1)
+        elif (tier in ['Tier3']):
+            va_alloc3.loc[day, group] = np.round(alloc_tier[day, group, tier].x, 1)
+for day in days:
+    for group in groups:
+        va_alloc.loc[day, group] = va_alloc12.loc[day, group] + va_alloc3.loc[day, group]
+
+pd.DataFrame.to_csv(va_alloc, 'D:/2021SpringStudy/Research/MCSI/Python/COVID_test_allocation/timevarying/allocation.csv', sep=',', na_rep='.', index=False)
